@@ -1,0 +1,109 @@
+:root {
+  /* surfaces */
+  --bg-app: #0a0c10;
+  --bg-panel: #0c0f14;
+  --bg-input: #12151b;
+  --bg-elevated: #14181f;
+  --bg-sunken: #0e1117;
+
+  /* borders */
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.1);
+
+  /* text */
+  --text-primary: #e6e9ef;
+  --text-secondary: #8b93a3;
+  --text-tertiary: #5b6373;
+  --text-faint: #454c59;
+
+  /* brand / semantic */
+  --gain: #16c784;
+  --loss: #f6465d;
+  --warn: #f5a623;
+  --crypto-accent: #f7931a;
+  --stock-accent: #6f9bff;
+
+  /* fonts */
+  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'Geist Mono', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+}
+
+@keyframes pulseDot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.82);
+  }
+}
+
+@keyframes fadeUp {
+  from {
+    transform: translateY(7px);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes popIn {
+  from {
+    transform: scale(0.97) translateY(5px);
+  }
+  to {
+    transform: scale(1) translateY(0);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2a313c;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #39424f;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+input {
+  font-family: inherit;
+  outline: none;
+}
+
+button {
+  font-family: inherit;
+}
