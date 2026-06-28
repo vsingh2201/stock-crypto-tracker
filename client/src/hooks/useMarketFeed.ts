@@ -1,32 +1,50 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SEED_WATCHLIST, UNIVERSE } from '../data/universe';
-import { genCandles, genSpark, TIMEFRAME_TICK_VOL_FACTOR } from '../lib/marketMath';
+import { genCandles, genSpark } from '../lib/marketMath';
 import type { Candle, ConnectionStatus, Timeframe, WatchlistItem } from '../types';
 
+// Configurable via client/.env: VITE_WS_URL=ws://localhost:8080
+const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined) ?? 'ws://localhost:8080';
+const RECONNECT_DELAY_MS = 3_000;
+
+// Mirror the relay server's outbound message shapes (server/src/types.ts ServerMessage).
+interface TickMessage {
+  type: 'tick';
+  symbol: string;
+  price: number;
+  timestamp: number;
+  volume: number;
+}
+
+interface StatusMessage {
+  type: 'status';
+  status: ConnectionStatus;
+}
+
+type RelayMessage = TickMessage | StatusMessage;
+
 /**
- * Stands in for the live feed today: ticks watchlist prices and the active
- * candle on a timer instead of reading frames off a socket. The relay server
- * (server/) will forward Finnhub trade/agg messages over a WebSocket; once
- * that's wired up, replace the setInterval tick loop below with a `ws.onmessage`
- * handler that applies the same state updates from real messages, and the
- * components consuming this hook's return value won't need to change.
+ * Connects to the Node.js relay server at WS_URL and wires live Finnhub
+ * price ticks into the watchlist + active chart.
+ *
+ * What changed from the mock:
+ *   - setInterval random-walk removed; replaced by ws.onmessage
+ *   - candle history is still synthesised by genCandles (WebSocket gives you
+ *     live trades, not historical OHLC — that needs a REST call to fill in)
+ *   - connection state is driven by ws lifecycle / relay status frames
+ *   - selectSymbol and addSymbol send subscribe frames to the relay
+ *
+ * The return shape is identical to the old mock hook, so Dashboard and every
+ * downstream component continue to work without any changes.
  */
 export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe) {
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() =>
     SEED_WATCHLIST.map(({ symbol, changePct }) => {
       const u = UNIVERSE.find((x) => x.symbol === symbol)!;
-      return {
-        symbol: u.symbol,
-        name: u.name,
-        exchange: u.exchange,
-        type: u.type,
-        price: u.seedPrice,
-        changePct,
-        spark: genSpark(changePct >= 0),
-      };
+      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct, spark: genSpark(changePct >= 0) };
     }),
   );
-  const [connection, setConnection] = useState<ConnectionStatus>('connected');
+  const [connection, setConnection] = useState<ConnectionStatus>('reconnecting');
   const [selected, setSelected] = useState(initialSymbol);
   const [timeframe, setTimeframeState] = useState<Timeframe>(initialTimeframe);
   const [candles, setCandles] = useState<Candle[]>(() => {
@@ -35,53 +53,119 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     return genCandles(u.seedPrice, sel.changePct, initialTimeframe);
   });
 
+  // Refs let event handlers always read the latest value without being
+  // recreated (avoids stale closures in ws.onmessage / reconnect timers).
   const candlesRef = useRef(candles);
   candlesRef.current = candles;
   const timeframeRef = useRef(timeframe);
   timeframeRef.current = timeframe;
   const watchlistRef = useRef(watchlist);
   watchlistRef.current = watchlist;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
+  const destroyedRef = useRef(false);
+
+  const send = useCallback((payload: object) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(payload));
+    }
+  }, []);
+
+  // Re-subscribe every watchlist symbol after a (re)connect.
+  const subscribeAll = useCallback(() => {
+    for (const item of watchlistRef.current) {
+      send({ type: 'subscribe', symbol: item.symbol });
+    }
+  }, [send]);
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (Math.random() < 0.035) {
-        setConnection((c) => (c === 'reconnecting' ? 'connected' : 'reconnecting'));
-      } else {
-        setConnection((c) => (c === 'reconnecting' ? 'connected' : c));
-      }
+    destroyedRef.current = false;
 
-      const tickVolFactor = TIMEFRAME_TICK_VOL_FACTOR[timeframeRef.current];
-      const raw = candlesRef.current.map((c) => ({ ...c }));
-      const last = raw[raw.length - 1];
-      last.close = last.close + last.close * (Math.random() - 0.5) * 2 * tickVolFactor;
-      last.high = Math.max(last.high, last.close);
-      last.low = Math.min(last.low, last.close);
-      setCandles(raw);
+    function connect() {
+      if (destroyedRef.current) return;
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
 
-      setWatchlist((prev) => {
-        const next = prev.map((w) => {
-          const drift = w.type === 'crypto' ? 0.0009 : 0.0006;
-          const price = w.price * (1 + (Math.random() - 0.5) * 2 * drift);
-          let changePct = w.changePct + ((price - w.price) / w.price) * 100;
-          changePct = Math.max(-9.5, Math.min(9.5, changePct));
-          return { ...w, price, changePct };
-        });
-        const idx = next.findIndex((w) => w.symbol === selected);
-        if (idx >= 0) {
-          const base = raw[0].open;
-          next[idx] = { ...next[idx], price: last.close, changePct: ((last.close - base) / base) * 100 };
+      ws.onopen = () => {
+        setConnection('connected');
+        subscribeAll();
+      };
+
+      ws.onmessage = (event: MessageEvent<string>) => {
+        let msg: RelayMessage;
+        try {
+          msg = JSON.parse(event.data) as RelayMessage;
+        } catch {
+          return;
         }
-        return next;
-      });
-    }, 1300);
-    return () => clearInterval(timer);
-  }, [selected]);
+
+        if (msg.type === 'status') {
+          setConnection(msg.status);
+          return;
+        }
+
+        if (msg.type === 'tick') {
+          const { symbol, price } = msg;
+
+          // Update watchlist price and rolling changePct.
+          setWatchlist((prev) => {
+            const idx = prev.findIndex((w) => w.symbol === symbol);
+            if (idx === -1) return prev;
+            const w = prev[idx];
+            const delta = ((price - w.price) / w.price) * 100;
+            const changePct = Math.max(-9.5, Math.min(9.5, w.changePct + delta));
+            const next = [...prev];
+            next[idx] = { ...w, price, changePct };
+            return next;
+          });
+
+          // Merge tick into the last candle of the active chart.
+          if (symbol === selectedRef.current) {
+            setCandles((prev) => {
+              const next = prev.map((c) => ({ ...c }));
+              const last = next[next.length - 1];
+              last.close = price;
+              last.high = Math.max(last.high, price);
+              last.low = Math.min(last.low, price);
+              return next;
+            });
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        // 'error' always fires before 'close'; let onclose own the reconnect loop.
+        setConnection('disconnected');
+      };
+
+      ws.onclose = () => {
+        if (destroyedRef.current) return;
+        setConnection('reconnecting');
+        reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
+      };
+    }
+
+    connect();
+
+    return () => {
+      destroyedRef.current = true;
+      clearTimeout(reconnectTimer.current);
+      wsRef.current?.close();
+      wsRef.current = null;
+    };
+  }, [subscribeAll]);
 
   const selectSymbol = useCallback((symbol: string) => {
     setSelected(symbol);
+    // Seed the chart with synthesised history at the current price.
     const w = watchlistRef.current.find((x) => x.symbol === symbol);
     if (w) setCandles(genCandles(w.price, w.changePct, timeframeRef.current));
-  }, []);
+    // Tell the relay to start forwarding ticks for this symbol.
+    send({ type: 'subscribe', symbol });
+  }, [send]);
 
   const setTimeframe = useCallback((tf: Timeframe) => {
     setTimeframeState(tf);
@@ -97,7 +181,8 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       const changePct = (Math.random() - 0.4) * 5;
       return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct, spark: genSpark(changePct >= 0) }];
     });
-  }, []);
+    send({ type: 'subscribe', symbol });
+  }, [send]);
 
   return { watchlist, connection, selected, timeframe, candles, selectSymbol, setTimeframe, addSymbol };
 }
