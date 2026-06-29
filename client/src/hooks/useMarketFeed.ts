@@ -39,18 +39,19 @@ type RelayMessage = TickMessage | StatusMessage;
  */
 export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe) {
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() =>
-    SEED_WATCHLIST.map(({ symbol, changePct }) => {
+    // changePct starts at 0 for all symbols — the real value is computed once
+    // the first tick arrives and sets the session baseline for that symbol.
+    SEED_WATCHLIST.map(({ symbol }) => {
       const u = UNIVERSE.find((x) => x.symbol === symbol)!;
-      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct, spark: genSpark(changePct >= 0) };
+      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false) };
     }),
   );
   const [connection, setConnection] = useState<ConnectionStatus>('reconnecting');
   const [selected, setSelected] = useState(initialSymbol);
   const [timeframe, setTimeframeState] = useState<Timeframe>(initialTimeframe);
   const [candles, setCandles] = useState<Candle[]>(() => {
-    const sel = SEED_WATCHLIST.find((w) => w.symbol === initialSymbol)!;
     const u = UNIVERSE.find((x) => x.symbol === initialSymbol)!;
-    return genCandles(u.seedPrice, sel.changePct, initialTimeframe);
+    return genCandles(u.seedPrice, 0, initialTimeframe);
   });
 
   // Refs let event handlers always read the latest value without being
@@ -63,6 +64,11 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   watchlistRef.current = watchlist;
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+
+  // First real tick price received per symbol this session — the anchor for
+  // changePct. Persists across reconnects because the session continues; only
+  // truly resets if the page is reloaded (a new session begins).
+  const sessionBaseline = useRef(new Map<string, number>());
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -110,15 +116,21 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
         if (msg.type === 'tick') {
           const { symbol, price } = msg;
 
-          // Update watchlist price and rolling changePct.
+          // Record the first tick for this symbol as the session baseline.
+          // changePct is then always (currentPrice - sessionOpen) / sessionOpen,
+          // not a rolling accumulation from the mock seed price.
+          const baseline = sessionBaseline.current;
+          if (!baseline.has(symbol)) {
+            baseline.set(symbol, price);
+          }
+          const sessionOpen = baseline.get(symbol)!;
+          const changePct = ((price - sessionOpen) / sessionOpen) * 100;
+
           setWatchlist((prev) => {
             const idx = prev.findIndex((w) => w.symbol === symbol);
             if (idx === -1) return prev;
-            const w = prev[idx];
-            const delta = ((price - w.price) / w.price) * 100;
-            const changePct = Math.max(-9.5, Math.min(9.5, w.changePct + delta));
             const next = [...prev];
-            next[idx] = { ...w, price, changePct };
+            next[idx] = { ...prev[idx], price, changePct };
             return next;
           });
 
@@ -178,8 +190,8 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       if (prev.some((w) => w.symbol === symbol)) return prev;
       const u = UNIVERSE.find((x) => x.symbol === symbol);
       if (!u) return prev;
-      const changePct = (Math.random() - 0.4) * 5;
-      return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct, spark: genSpark(changePct >= 0) }];
+      // changePct will be set correctly on the first tick from the relay.
+      return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false) }];
     });
     send({ type: 'subscribe', symbol });
   }, [send]);
