@@ -66,9 +66,10 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
 
-  // First real tick price received per symbol this session — the anchor for
-  // changePct. Persists across reconnects because the session continues; only
-  // truly resets if the page is reloaded (a new session begins).
+  // First tick received per symbol after each (re)connect anchors changePct.
+  // Cleared in ws.onopen so a server restart — which resets the mock fallback's
+  // price state to DEFAULT_SEED_PRICES — never mixes with a baseline that was
+  // set by real ticks from a previous connection at a very different price level.
   const sessionBaseline = useRef(new Map<string, number>());
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -98,6 +99,11 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
 
       ws.onopen = () => {
         setConnection('connected');
+        // A new connection may be talking to a freshly restarted server whose
+        // mock fallback has no lastPrice state and will emit DEFAULT_SEED_PRICES.
+        // Stale baselines from the previous connection would produce nonsensical
+        // changePct values, so reset here and let the first tick re-anchor.
+        sessionBaseline.current.clear();
         subscribeAll();
       };
 
