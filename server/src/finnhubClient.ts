@@ -32,137 +32,152 @@ const DEFAULT_SEED_PRICES: Record<string, number> = {
 
 // ── MockFallback ─────────────────────────────────────────────────────────────
 
+interface SymbolState {
+  active: boolean;
+  lastPrice: number | undefined;
+  silenceTimer: ReturnType<typeof setTimeout> | null;
+}
+
 /**
- * Watches the real-tick stream for silence. If no real tick arrives within
- * SILENCE_THRESHOLD_MS, enters mock mode and emits simulated ticks every
- * MOCK_INTERVAL_MS using a ±0.05%–0.15% random walk from the last known price.
+ * Per-symbol after-hours mock fallback.
  *
- * Mock ticks are routed through the same onTick callback as real ticks, so
- * index.ts, ClientManager, and browser clients are unaware of the difference.
+ * Each subscribed symbol gets its own 30-second silence watchdog. When a
+ * symbol's watchdog fires (no real tick for SILENCE_THRESHOLD_MS), that symbol
+ * independently enters mock mode. A single shared setInterval drives all
+ * currently-mocked symbols at MOCK_INTERVAL_MS cadence; it starts when the
+ * first symbol enters mock mode and stops when the last exits.
  *
- * Real data always takes priority: the first real tick received while in mock
- * mode immediately exits mock mode and restarts the silence watchdog.
+ * Real ticks are precise: only the symbol that received a real tick exits mock
+ * mode — other symbols may still be mocked.
+ *
+ * Mock ticks flow through the same onTick callback as real ticks (with
+ * source: 'mock'), so index.ts and ClientManager require no changes.
  */
 class MockFallback {
-  private readonly lastPrices = new Map<string, number>();
-  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly symbols = new Map<string, SymbolState>();
   private mockInterval: ReturnType<typeof setInterval> | null = null;
-  private active = false;
+
+  constructor(private readonly onTick: (tick: PriceTick) => void) {}
 
   /**
-   * @param getSubscribed - Returns the live subscribed-symbol set from
-   *   FinnhubClient. Reading via a getter (not a snapshot) means mock ticks
-   *   always reflect the current subscription state, even after mid-session
-   *   subscribe/unsubscribe calls.
-   * @param onTick - Identical callback used for real ticks in FinnhubClient.
-   */
-  constructor(
-    private readonly getSubscribed: () => ReadonlySet<string>,
-    private readonly onTick: (tick: PriceTick) => void,
-  ) {}
-
-  /**
-   * Call whenever a real Finnhub trade tick is received.
-   * Records the price as the new random-walk anchor and resets the silence
-   * watchdog. If mock mode was active, exits it immediately.
+   * Call when a real Finnhub tick arrives for symbol.
+   * Resets that symbol's silence watchdog; exits its mock mode if active.
    */
   onRealTick(symbol: string, price: number): void {
-    this.lastPrices.set(symbol, price);
+    const state = this.ensure(symbol);
+    state.lastPrice = price;
 
-    if (this.active) {
-      console.log('[mock] exiting mock mode — real tick received');
-      this.active = false;
-      this.stopMockInterval();
+    if (state.active) {
+      console.log(`[mock] ${symbol} exiting mock mode — real tick received`);
+      state.active = false;
+      this.maybeStopInterval();
     }
 
-    this.resetSilenceTimer();
+    this.resetTimer(symbol);
   }
 
   /**
-   * Call after a symbol is added to the subscription set.
-   * Starts the silence watchdog if it is not already running.
+   * Call when symbol is first subscribed.
+   * Starts its silence watchdog if not already running.
    */
-  onSubscribe(): void {
-    if (!this.silenceTimer && !this.active) {
-      this.resetSilenceTimer();
+  onSubscribe(symbol: string): void {
+    const state = this.ensure(symbol);
+    if (!state.silenceTimer && !state.active) {
+      this.resetTimer(symbol);
     }
   }
 
   /**
-   * Call after a symbol is removed from the subscription set.
-   * Stops all timers if no subscriptions remain.
+   * Call when symbol is unsubscribed.
+   * Clears its watchdog and exits mock mode if it was active.
    */
-  onUnsubscribe(): void {
-    if (this.getSubscribed().size === 0) {
-      this.stopSilenceTimer();
-      if (this.active) {
-        this.active = false;
-        this.stopMockInterval();
-      }
+  onUnsubscribe(symbol: string): void {
+    const state = this.symbols.get(symbol);
+    if (!state) return;
+    if (state.silenceTimer) {
+      clearTimeout(state.silenceTimer);
+      state.silenceTimer = null;
     }
+    if (state.active) {
+      state.active = false;
+      this.maybeStopInterval();
+    }
+    this.symbols.delete(symbol);
   }
 
-  /** Stop all timers — must be called from FinnhubClient.destroy(). */
+  /** Clear all per-symbol timers and the global interval. */
   destroy(): void {
-    this.stopSilenceTimer();
-    this.stopMockInterval();
-  }
-
-  // ── private ───────────────────────────────────────────────────────────────
-
-  private resetSilenceTimer(): void {
-    this.stopSilenceTimer();
-    if (this.getSubscribed().size === 0) return;
-
-    this.silenceTimer = setTimeout(() => {
-      this.silenceTimer = null;
-      this.enterMockMode();
-    }, SILENCE_THRESHOLD_MS);
-  }
-
-  private stopSilenceTimer(): void {
-    if (this.silenceTimer !== null) {
-      clearTimeout(this.silenceTimer);
-      this.silenceTimer = null;
+    for (const state of this.symbols.values()) {
+      if (state.silenceTimer) clearTimeout(state.silenceTimer);
     }
-  }
-
-  private enterMockMode(): void {
-    if (this.active) return;
-    this.active = true;
-    console.log(
-      `[mock] entering mock mode — no real ticks for ${SILENCE_THRESHOLD_MS / 1000}s`,
-    );
-    // Fire immediately so clients see movement at once, then every interval.
-    this.emitMockTicks();
-    this.mockInterval = setInterval(() => this.emitMockTicks(), MOCK_INTERVAL_MS);
-  }
-
-  private stopMockInterval(): void {
-    if (this.mockInterval !== null) {
+    this.symbols.clear();
+    if (this.mockInterval) {
       clearInterval(this.mockInterval);
       this.mockInterval = null;
     }
   }
 
-  private emitMockTicks(): void {
-    const now = Date.now();
-    const symbols = this.getSubscribed();
+  // ── private ───────────────────────────────────────────────────────────────
 
-    for (const symbol of symbols) {
-      const base = this.lastPrices.get(symbol) ?? DEFAULT_SEED_PRICES[symbol] ?? 100;
-      const magnitude = MOCK_MIN_DRIFT + Math.random() * (MOCK_MAX_DRIFT - MOCK_MIN_DRIFT);
-      const sign = Math.random() < 0.5 ? 1 : -1;
-      const rawPrice = base * (1 + sign * magnitude);
-      // Preserve meaningful decimal places: 4 for sub-dollar assets, 2 otherwise.
-      const price = +rawPrice.toFixed(rawPrice < 1 ? 4 : 2);
-      this.lastPrices.set(symbol, price);
-
-      this.onTick({ symbol, price, timestamp: now, volume: 0 });
+  private ensure(symbol: string): SymbolState {
+    if (!this.symbols.has(symbol)) {
+      this.symbols.set(symbol, { active: false, lastPrice: undefined, silenceTimer: null });
     }
+    return this.symbols.get(symbol)!;
+  }
 
-    if (symbols.size > 0) {
-      console.log(`[mock] emitted ${symbols.size} tick(s) for: ${[...symbols].join(', ')}`);
+  private resetTimer(symbol: string): void {
+    const state = this.ensure(symbol);
+    if (state.silenceTimer) clearTimeout(state.silenceTimer);
+    state.silenceTimer = setTimeout(() => {
+      state.silenceTimer = null;
+      this.enterMockMode(symbol);
+    }, SILENCE_THRESHOLD_MS);
+  }
+
+  private enterMockMode(symbol: string): void {
+    const state = this.symbols.get(symbol);
+    if (!state || state.active) return;
+    state.active = true;
+    console.log(
+      `[mock] ${symbol} entering mock mode — no real ticks for ${SILENCE_THRESHOLD_MS / 1000}s`,
+    );
+    // Emit immediately so clients see movement right away.
+    this.emitTick(symbol, state);
+    // Start the shared interval if nothing else is already running.
+    if (!this.mockInterval) {
+      this.mockInterval = setInterval(() => this.tickAll(), MOCK_INTERVAL_MS);
+    }
+  }
+
+  private tickAll(): void {
+    const active: string[] = [];
+    for (const [symbol, state] of this.symbols) {
+      if (state.active) {
+        this.emitTick(symbol, state);
+        active.push(symbol);
+      }
+    }
+    if (active.length > 0) {
+      console.log(`[mock] emitted ${active.length} tick(s) for: ${active.join(', ')}`);
+    }
+  }
+
+  private emitTick(symbol: string, state: SymbolState): void {
+    const base = state.lastPrice ?? DEFAULT_SEED_PRICES[symbol] ?? 100;
+    const magnitude = MOCK_MIN_DRIFT + Math.random() * (MOCK_MAX_DRIFT - MOCK_MIN_DRIFT);
+    const sign = Math.random() < 0.5 ? 1 : -1;
+    const raw = base * (1 + sign * magnitude);
+    const price = +raw.toFixed(raw < 1 ? 4 : 2);
+    state.lastPrice = price;
+    this.onTick({ symbol, price, timestamp: Date.now(), volume: 0, source: 'mock' });
+  }
+
+  private maybeStopInterval(): void {
+    const anyActive = [...this.symbols.values()].some((s) => s.active);
+    if (!anyActive && this.mockInterval) {
+      clearInterval(this.mockInterval);
+      this.mockInterval = null;
     }
   }
 }
@@ -182,14 +197,10 @@ interface FinnhubClientOptions {
  * The attempt counter resets on a successful open so recovered connections
  * start fresh.
  *
- * `subscribedSymbols` is the source of truth for what Finnhub should be
- * streaming. On reconnect every symbol is re-subscribed automatically because
- * Finnhub does not persist subscriptions across connections.
- *
- * A MockFallback instance watches for real-tick silence and automatically
- * emits simulated ticks when no real data has arrived for SILENCE_THRESHOLD_MS.
- * Mock ticks flow through the same onTick callback as real ticks, so
- * index.ts and ClientManager need no changes.
+ * A MockFallback instance watches each subscribed symbol independently for
+ * silence. Symbols enter and exit mock mode on their own schedules — a crypto
+ * symbol trading 24/7 may be live while a US stock that closed hours ago is
+ * being mocked. Mock ticks carry source: 'mock'; real ticks carry source: 'live'.
  */
 export class FinnhubClient {
   private ws: WebSocket | null = null;
@@ -200,10 +211,7 @@ export class FinnhubClient {
   private readonly mock: MockFallback;
 
   constructor(private readonly options: FinnhubClientOptions) {
-    this.mock = new MockFallback(
-      () => this.subscribedSymbols,
-      options.onTick,
-    );
+    this.mock = new MockFallback(options.onTick);
   }
 
   connect(): void {
@@ -244,11 +252,12 @@ export class FinnhubClient {
           price: trade.p,
           timestamp: trade.t,
           volume: trade.v,
+          source: 'live',
         };
 
         this.options.onTick(tick);
-        // Inform MockFallback — updates its last-price anchor and resets the
-        // silence watchdog (exits mock mode if it was active).
+        // Tell MockFallback a real tick arrived for this symbol — resets its
+        // per-symbol silence watchdog and exits mock mode if it was active.
         this.mock.onRealTick(trade.s, trade.p);
       }
     });
@@ -274,8 +283,8 @@ export class FinnhubClient {
       this.sendFrame({ type: 'subscribe', symbol });
       console.log(`[finnhub] subscribed ${symbol}`);
     }
-    // Start the silence watchdog for this symbol if it isn't already running.
-    this.mock.onSubscribe();
+    // Start this symbol's per-symbol silence watchdog.
+    this.mock.onSubscribe(symbol);
   }
 
   unsubscribe(symbol: string): void {
@@ -285,15 +294,15 @@ export class FinnhubClient {
       this.sendFrame({ type: 'unsubscribe', symbol });
       console.log(`[finnhub] unsubscribed ${symbol}`);
     }
-    // Stop mock machinery if no symbols remain.
-    this.mock.onUnsubscribe();
+    // Clear this symbol's watchdog and remove it from mock state.
+    this.mock.onUnsubscribe(symbol);
   }
 
   destroy(): void {
     this.destroyed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.mock.destroy(); // clears silence timer and mock interval
+    this.mock.destroy();
     this.ws?.close();
     this.ws = null;
   }

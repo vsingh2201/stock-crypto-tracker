@@ -14,6 +14,7 @@ interface TickMessage {
   price: number;
   timestamp: number;
   volume: number;
+  source: 'live' | 'mock';
 }
 
 interface StatusMessage {
@@ -43,7 +44,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     // the first tick arrives and sets the session baseline for that symbol.
     SEED_WATCHLIST.map(({ symbol }) => {
       const u = UNIVERSE.find((x) => x.symbol === symbol)!;
-      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false) };
+      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const };
     }),
   );
   const [connection, setConnection] = useState<ConnectionStatus>('reconnecting');
@@ -114,7 +115,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
         }
 
         if (msg.type === 'tick') {
-          const { symbol, price } = msg;
+          const { symbol, price, source } = msg;
 
           // Record the first tick for this symbol as the session baseline.
           // changePct is then always (currentPrice - sessionOpen) / sessionOpen,
@@ -130,7 +131,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
             const idx = prev.findIndex((w) => w.symbol === symbol);
             if (idx === -1) return prev;
             const next = [...prev];
-            next[idx] = { ...prev[idx], price, changePct };
+            next[idx] = { ...prev[idx], price, changePct, source };
             return next;
           });
 
@@ -191,7 +192,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       const u = UNIVERSE.find((x) => x.symbol === symbol);
       if (!u) return prev;
       // changePct will be set correctly on the first tick from the relay.
-      return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false) }];
+      return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const }];
     });
     send({ type: 'subscribe', symbol });
   }, [send]);

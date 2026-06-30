@@ -14,6 +14,7 @@ export interface Quote extends Instrument {
 
 export interface WatchlistItem extends Quote {
   spark: number[];
+  source: 'live' | 'mock';
 }
 
 export interface Candle {

@@ -13,10 +13,6 @@ export function TopBar() {
         <span className="top-bar__badge">REAL-TIME</span>
       </div>
       <div className="top-bar__right">
-        <div className="top-bar__status">
-          <span className="top-bar__status-dot" />
-          Markets open
-        </div>
         <div className="top-bar__avatar">AC</div>
       </div>
     </div>

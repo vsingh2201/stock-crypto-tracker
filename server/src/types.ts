@@ -20,6 +20,7 @@ export interface TickMessage {
   price: number;
   timestamp: number;
   volume: number;
+  source: 'live' | 'mock';
 }
 
 export interface StatusMessage {
@@ -56,4 +57,5 @@ export interface PriceTick {
   price: number;
   timestamp: number;
   volume: number;
+  source: 'live' | 'mock';
 }

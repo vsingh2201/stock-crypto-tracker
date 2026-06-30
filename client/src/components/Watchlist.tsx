@@ -26,7 +26,12 @@ export function Watchlist({ items, selected, gainColor, lossColor, onSelect }: W
           >
             <div className="watchlist__bar" style={{ background: isSelected ? gainColor : 'transparent' }} />
             <div className="watchlist__info">
-              <div className="watchlist__symbol">{w.symbol}</div>
+              <div className="watchlist__symbol">
+                {w.symbol}
+                {w.source === 'mock' && (
+                  <span className="watchlist__sim-dot" title="Simulated data" />
+                )}
+              </div>
               <div className="watchlist__name">{w.name}</div>
             </div>
             <svg width="58" height="24" viewBox="0 0 56 24" fill="none" preserveAspectRatio="none" className="watchlist__spark">

@@ -63,3 +63,14 @@
   font-weight: 600;
   font-family: var(--font-mono);
 }
+
+.watchlist__sim-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #f5a623;
+  margin-left: 5px;
+  vertical-align: middle;
+  opacity: 0.85;
+}

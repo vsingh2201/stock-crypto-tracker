@@ -92,6 +92,7 @@ export class ClientManager {
       price: tick.price,
       timestamp: tick.timestamp,
       volume: tick.volume,
+      source: tick.source,
     } satisfies import('./types').TickMessage);
 
     for (const client of clients) {

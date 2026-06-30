@@ -14,6 +14,29 @@ const GAIN = '#16c784';
 const LOSS = '#f6465d';
 const TIMEFRAMES: Timeframe[] = ['1D', '1W', '1M'];
 
+// Returns true when the current moment falls within US equities market hours
+// (Mon–Fri 09:30–16:00 America/New_York), DST-aware via Intl.
+function isUSMarketOpen(): boolean {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date());
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+    const weekday = get('weekday');
+    if (weekday === 'Sat' || weekday === 'Sun') return false;
+    const h = parseInt(get('hour'), 10) % 24; // normalize rare 24 → 0
+    const m = parseInt(get('minute'), 10);
+    const mins = h * 60 + m;
+    return mins >= 9 * 60 + 30 && mins < 16 * 60;
+  } catch {
+    return false;
+  }
+}
+
 export function Dashboard() {
   const feed = useMarketFeed('BTC-USD', '1D');
   const [alertOpen, setAlertOpen] = useState(false);
@@ -34,6 +57,7 @@ export function Dashboard() {
   const up = selectedQuote.changePct >= 0;
   const headerColor = up ? GAIN : LOSS;
   const dollarChange = selectedQuote.price - selectedQuote.price / (1 + selectedQuote.changePct / 100);
+  const isSimulated = selectedQuote.source === 'mock';
 
   const connMap = {
     connected: { color: GAIN, label: 'Live', bg: 'rgba(22,199,132,.1)' },
@@ -41,6 +65,8 @@ export function Dashboard() {
     disconnected: { color: LOSS, label: 'Disconnected', bg: 'rgba(246,70,93,.1)' },
   } as const;
   const conn = connMap[feed.connection];
+
+  const marketOpen = isUSMarketOpen();
 
   return (
     <div className="dashboard">
@@ -54,6 +80,9 @@ export function Dashboard() {
                 <span className="dashboard__symbol-name">
                   {selectedQuote.name} · {selectedQuote.exchange.charAt(0) + selectedQuote.exchange.slice(1).toLowerCase()}
                 </span>
+                {isSimulated && (
+                  <span className="dashboard__sim-badge">Simulated</span>
+                )}
               </div>
               <div className="dashboard__price-row">
                 <span className="dashboard__price">${formatPrice(selectedQuote.price)}</span>
@@ -99,9 +128,25 @@ export function Dashboard() {
                 <span>Watchlist</span>
                 <span className="dashboard__watchlist-count">{feed.watchlist.length}</span>
               </div>
-              <div className="dashboard__conn" style={{ color: conn.color, background: conn.bg }}>
-                <span className="dashboard__conn-dot" style={{ background: conn.color }} />
-                {conn.label}
+              <div className="dashboard__meta-pills">
+                <div
+                  className="dashboard__market-hours"
+                  style={
+                    marketOpen
+                      ? { color: '#6f9bff', background: 'rgba(111,155,255,.1)' }
+                      : { color: '#8b93a3', background: 'rgba(139,147,163,.08)' }
+                  }
+                >
+                  <span
+                    className="dashboard__market-dot"
+                    style={{ background: marketOpen ? '#6f9bff' : '#8b93a3' }}
+                  />
+                  {marketOpen ? 'Markets open' : 'Markets closed'}
+                </div>
+                <div className="dashboard__conn" style={{ color: conn.color, background: conn.bg }}>
+                  <span className="dashboard__conn-dot" style={{ background: conn.color }} />
+                  {conn.label}
+                </div>
               </div>
             </div>
             <Search
