@@ -800,3 +800,217 @@ ws.on('close', (code, reason) => {
 sees `true` and exits early. The same flag gates the top of `connect()`, so
 even if a race caused `setTimeout`'s callback to fire after `destroy()`, it
 would return immediately without opening a new socket.
+
+---
+
+## 9. After-Hours Mock Fallback
+
+### The problem
+
+Finnhub only broadcasts trade ticks during live market hours. Outside US market
+hours the upstream WebSocket stays connected but silent — the relay keeps its
+`status: connected` message accurate, yet no price updates flow to the browser.
+This makes the dashboard useless for demos and manual testing on evenings or
+weekends.
+
+### Design goal
+
+Make the app fully demoable 24/7 without adding a second code path in
+`index.ts` or `clientManager.ts`. Mock ticks must be transparent — they flow
+through the same `onTick` callback as real ticks, so the rest of the system
+never knows the difference.
+
+### The `MockFallback` class (`finnhubClient.ts`)
+
+`MockFallback` is a private class defined inside `finnhubClient.ts` and
+instantiated by `FinnhubClient` in its constructor. It is not exported — it is
+an implementation detail of `FinnhubClient` only.
+
+```
+FinnhubClient
+├── subscribedSymbols: Set<string>   ← source of truth for subscriptions
+├── mock: MockFallback               ← holds a getter into subscribedSymbols
+│   ├── lastPrices: Map<string, number>
+│   ├── silenceTimer: Timeout | null
+│   └── mockInterval: Interval | null
+└── options.onTick(tick)             ← used by both real ticks and mock ticks
+```
+
+`MockFallback` receives two dependencies:
+- `getSubscribed: () => ReadonlySet<string>` — a getter (not a snapshot) so it
+  always reads the live subscription set, even after mid-session
+  subscribe/unsubscribe calls.
+- `onTick: (tick: PriceTick) => void` — the same callback `FinnhubClient` uses
+  for real ticks, wired directly to `clientManager.broadcast` in `index.ts`.
+
+### State machine
+
+```
+          ┌──────────────────────────────────────────┐
+          │              LIVE (default)              │
+          │  silenceTimer running (30 s)             │
+          └──────────────┬───────────────────────────┘
+   no real tick for 30 s │
+                         ▼
+          ┌──────────────────────────────────────────┐
+          │              MOCK MODE                   │
+          │  mockInterval fires every 2 s            │
+          │  silenceTimer stopped                    │
+          └──────────────┬───────────────────────────┘
+     real tick received  │
+                         ▼
+          ┌──────────────────────────────────────────┐
+          │              LIVE (reset)                │
+          │  silenceTimer restarted from 0           │
+          └──────────────────────────────────────────┘
+```
+
+### Silence watchdog
+
+`resetSilenceTimer()` clears any existing timer and starts a new `setTimeout`
+for `SILENCE_THRESHOLD_MS` (default 30 000 ms). It is called:
+- From `onRealTick()` — every real tick resets the 30-second countdown.
+- From `onSubscribe()` — when the first symbol is subscribed and no timer is
+  running yet.
+
+When the timeout fires (30 s of silence), it calls `enterMockMode()`.
+
+### Entering and exiting mock mode
+
+`enterMockMode()`:
+1. Sets `active = true`.
+2. Logs `[mock] entering mock mode — no real ticks for 30s`.
+3. Calls `emitMockTicks()` immediately (no delay before the first mock tick).
+4. Starts a `setInterval` to call `emitMockTicks()` every 2 s.
+
+When `onRealTick()` is called while `active === true`:
+1. Sets `active = false`.
+2. Logs `[mock] exiting mock mode — real tick received`.
+3. Stops the mock interval.
+4. Restarts the silence watchdog from 0.
+
+### Random walk formula
+
+For each subscribed symbol on every mock tick:
+
+```
+base      = lastPrices.get(symbol) ?? DEFAULT_SEED_PRICES[symbol] ?? 100
+magnitude = rand(0.0005, 0.0015)           // 0.05 % – 0.15 % per tick
+sign      = rand() < 0.5 ? +1 : -1
+rawPrice  = base × (1 + sign × magnitude)
+price     = toFixed(rawPrice < 1 ? 4 : 2) // 4 dp for sub-dollar assets
+```
+
+`lastPrices` is updated after each emission, so consecutive mock ticks form a
+continuous walk rather than oscillating around the seed price.
+
+### Default seed prices
+
+When a symbol has never received a real tick, `lastPrices` has no entry.
+`DEFAULT_SEED_PRICES` provides reasonable starting prices for the instruments
+in the default watchlist:
+
+| Symbol  | Seed price |
+|---------|------------|
+| BTC-USD | 67 000     |
+| ETH-USD | 3 400      |
+| SOL-USD | 150        |
+| NVDA    | 195        |
+| AAPL    | 213        |
+| TSLA    | 183        |
+| SPY     | 548        |
+| (other) | 100        |
+
+### Log output
+
+| Condition                        | Log line                                                       |
+|----------------------------------|----------------------------------------------------------------|
+| Enter mock mode                  | `[mock] entering mock mode — no real ticks for 30s`          |
+| Exit mock mode                   | `[mock] exiting mock mode — real tick received`              |
+| Each 2-second emission cycle     | `[mock] emitted N tick(s) for: SYM1, SYM2, …`               |
+
+Individual per-symbol prices are not logged to avoid flooding the terminal when
+7+ symbols are active.
+
+### Integration points in `FinnhubClient`
+
+| `FinnhubClient` method | `MockFallback` call      | Purpose                               |
+|------------------------|--------------------------|---------------------------------------|
+| `constructor`          | `new MockFallback(...)`  | Wires the getter and the onTick cb    |
+| `on('message')`        | `mock.onRealTick(s, p)`  | Updates price anchor, resets watchdog |
+| `subscribe()`          | `mock.onSubscribe()`     | Starts watchdog on first subscription |
+| `unsubscribe()`        | `mock.onUnsubscribe()`   | Stops everything if no symbols remain |
+| `destroy()`            | `mock.destroy()`         | Clears both timers before socket close|
+
+`index.ts` and `clientManager.ts` require zero changes — the mock is entirely
+self-contained inside `finnhubClient.ts`.
+
+### Testing without waiting 30 seconds
+
+Set `MOCK_SILENCE_THRESHOLD_MS` in your shell before starting the server:
+
+```bash
+# 5-second silence window — mock mode activates quickly for testing
+MOCK_SILENCE_THRESHOLD_MS=5000 npm run dev
+```
+
+The constant is read once at module load:
+
+```typescript
+const SILENCE_THRESHOLD_MS = parseInt(
+  process.env.MOCK_SILENCE_THRESHOLD_MS ?? '30000',
+  10,
+);
+```
+
+With the 5-second override, the expected terminal output after startup is:
+
+```
+[relay] listening on ws://localhost:8080
+[finnhub] connecting (attempt 1)
+[finnhub] connected
+[relay] client connected from ::1 (total: 1)
+[relay] subscribe   BTC-USD  isFirst=true
+[relay] subscribe   ETH-USD  isFirst=true
+... (remaining symbols)
+[finnhub] subscribed BTC-USD
+[finnhub] subscribed ETH-USD
+... 5 seconds later (or 30 outside market hours) ...
+[mock] entering mock mode — no real ticks for 5s
+[mock] emitted 7 tick(s) for: BTC-USD, ETH-USD, SOL-USD, NVDA, AAPL, TSLA, SPY
+[mock] emitted 7 tick(s) for: BTC-USD, ETH-USD, SOL-USD, NVDA, AAPL, TSLA, SPY
+```
+
+When market hours resume and the first real Finnhub tick arrives:
+
+```
+[mock] exiting mock mode — real tick received
+```
+
+### Interview angles
+
+**Why keep `MockFallback` in the same file as `FinnhubClient` rather than a
+separate module?** The class is not exported and has no other consumers — it is
+an implementation detail of one class. Separating it would create a module
+boundary where there is no semantic boundary, making the code harder to trace.
+The file is longer, but the `MockFallback` → `FinnhubClient` relationship is
+immediately legible in one scroll.
+
+**Why use a getter `() => this.subscribedSymbols` instead of passing the Set
+by value?** A getter always reads the live Set. If you passed
+`this.subscribedSymbols` by reference (a Set is a reference type in JS, so
+this would actually work), it would also see mutations. But using an explicit
+getter documents the intent — "I want current state at call time" — and remains
+correct even if `FinnhubClient` ever replaces the Set reference (e.g. on
+reconnect). Explicit is better than relying on Set reference identity.
+
+**What happens if a symbol is subscribed while mock mode is active?**
+`emitMockTicks()` calls `getSubscribed()` fresh on every tick, so the new
+symbol is included in the very next 2-second cycle. Its `lastPrices` entry is
+absent, so `DEFAULT_SEED_PRICES` or 100 is used as the starting anchor.
+
+**Why emit immediately (`emitMockTicks()` before `setInterval`) when entering
+mock mode?** Without the immediate call, clients would wait up to 2 seconds
+after the mode transition before seeing any movement. Emitting right away means
+the UI responds at the exact moment the threshold is crossed, not 2 seconds
+later.
