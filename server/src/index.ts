@@ -3,6 +3,8 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { FinnhubClient } from "./finnhubClient";
 import { ClientManager } from "./clientManager";
+import { runMigrations } from "./db";
+import { handleWatchlist } from "./routes/watchlist";
 import type { ClientMessage, StatusMessage } from "./types";
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -42,7 +44,21 @@ const finnhub = new FinnhubClient({
 
 // ── HTTP server (needed to inspect the Upgrade request for CORS) ─────────────
 
-const server = http.createServer((_req, res) => {
+const server = http.createServer(async (req, res) => {
+  const method = req.method ?? 'GET';
+  const url = new URL(req.url ?? '/', 'http://localhost');
+
+  // Health check
+  if (url.pathname === '/health' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+
+  // Watchlist REST API
+  const handled = await handleWatchlist(req, res, finnhub);
+  if (handled) return;
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Pulse relay — WebSocket endpoint");
 });
@@ -113,10 +129,17 @@ wss.on("connection", (ws: WebSocket, req) => {
 
 // ── Start ────────────────────────────────────────────────────────────────────
 
-server.listen(PORT, () => {
-  console.log(`[relay] listening on ws://localhost:${PORT}`);
-  finnhub.connect();
-});
+runMigrations()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`[relay] listening on ws://localhost:${PORT}`);
+      finnhub.connect();
+    });
+  })
+  .catch((err) => {
+    console.error('[db] failed to connect or migrate:', err);
+    process.exit(1);
+  });
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 

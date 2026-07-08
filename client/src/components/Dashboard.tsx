@@ -51,7 +51,10 @@ export function Dashboard() {
     toastTimer.current = setTimeout(() => setToast(null), 2400);
   };
 
-  const selectedQuote = feed.watchlist.find((w) => w.symbol === feed.selected);
+  // Fall back to the first item if the selected symbol isn't in the watchlist yet
+  // (e.g. during the brief window between the API response updating the watchlist
+  // and the hook re-selecting a valid symbol).
+  const selectedQuote = feed.watchlist.find((w) => w.symbol === feed.selected) ?? feed.watchlist[0];
   if (!selectedQuote) return null;
 
   const up = selectedQuote.changePct >= 0;

@@ -3,11 +3,20 @@ import { SEED_WATCHLIST, UNIVERSE } from '../data/universe';
 import { genCandles, genSpark } from '../lib/marketMath';
 import type { Candle, ConnectionStatus, Timeframe, WatchlistItem } from '../types';
 
-// Configurable via client/.env: VITE_WS_URL=ws://localhost:8080
 const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined) ?? 'ws://localhost:8080';
+const API_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:8080';
 const RECONNECT_DELAY_MS = 3_000;
 
-// Mirror the relay server's outbound message shapes (server/src/types.ts ServerMessage).
+// Get or create a stable session ID for this browser.
+const SESSION_ID: string = (() => {
+  let id = localStorage.getItem('pulse_session_id');
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem('pulse_session_id', id);
+  }
+  return id;
+})();
+
 interface TickMessage {
   type: 'tick';
   symbol: string;
@@ -24,28 +33,15 @@ interface StatusMessage {
 
 type RelayMessage = TickMessage | StatusMessage;
 
-/**
- * Connects to the Node.js relay server at WS_URL and wires live Finnhub
- * price ticks into the watchlist + active chart.
- *
- * What changed from the mock:
- *   - setInterval random-walk removed; replaced by ws.onmessage
- *   - candle history is still synthesised by genCandles (WebSocket gives you
- *     live trades, not historical OHLC — that needs a REST call to fill in)
- *   - connection state is driven by ws lifecycle / relay status frames
- *   - selectSymbol and addSymbol send subscribe frames to the relay
- *
- * The return shape is identical to the old mock hook, so Dashboard and every
- * downstream component continue to work without any changes.
- */
+function buildItem(symbol: string): WatchlistItem | null {
+  const u = UNIVERSE.find((x) => x.symbol === symbol);
+  if (!u) return null;
+  return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const };
+}
+
 export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe) {
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() =>
-    // changePct starts at 0 for all symbols — the real value is computed once
-    // the first tick arrives and sets the session baseline for that symbol.
-    SEED_WATCHLIST.map(({ symbol }) => {
-      const u = UNIVERSE.find((x) => x.symbol === symbol)!;
-      return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const };
-    }),
+    SEED_WATCHLIST.map(({ symbol }) => buildItem(symbol)!),
   );
   const [connection, setConnection] = useState<ConnectionStatus>('reconnecting');
   const [selected, setSelected] = useState(initialSymbol);
@@ -55,8 +51,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     return genCandles(u.seedPrice, 0, initialTimeframe);
   });
 
-  // Refs let event handlers always read the latest value without being
-  // recreated (avoids stale closures in ws.onmessage / reconnect timers).
   const candlesRef = useRef(candles);
   candlesRef.current = candles;
   const timeframeRef = useRef(timeframe);
@@ -66,12 +60,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
 
-  // First tick received per symbol after each (re)connect anchors changePct.
-  // Cleared in ws.onopen so a server restart — which resets the mock fallback's
-  // price state to DEFAULT_SEED_PRICES — never mixes with a baseline that was
-  // set by real ticks from a previous connection at a very different price level.
   const sessionBaseline = useRef(new Map<string, number>());
-
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
   const destroyedRef = useRef(false);
@@ -82,12 +71,53 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     }
   }, []);
 
-  // Re-subscribe every watchlist symbol after a (re)connect.
   const subscribeAll = useCallback(() => {
     for (const item of watchlistRef.current) {
       send({ type: 'subscribe', symbol: item.symbol });
     }
   }, [send]);
+
+  // Load persisted watchlist from the REST API on mount.
+  // Falls back to the seed data already in state if the request fails or times out.
+  useEffect(() => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+      console.warn('[api] watchlist fetch timed out — keeping seed data');
+    }, 5_000);
+
+    fetch(`${API_URL}/api/watchlist`, {
+      headers: { 'x-session-id': SESSION_ID },
+      signal: controller.signal,
+    })
+      .then((r) => r.json())
+      .then(({ symbols }: { symbols: string[] }) => {
+        const items = symbols.map(buildItem).filter((x): x is WatchlistItem => x !== null);
+        if (items.length === 0) return; // nothing usable — keep seed data
+
+        setWatchlist(items);
+
+        // If the currently selected symbol dropped out of the new watchlist,
+        // pivot to the first item so Dashboard never hits selectedQuote === undefined.
+        if (!items.some((w) => w.symbol === selectedRef.current)) {
+          const first = items[0];
+          setSelected(first.symbol);
+          setCandles(genCandles(first.price, first.changePct, timeframeRef.current));
+        }
+
+        // Subscribe the loaded symbols if the WS is already open.
+        for (const { symbol } of items) {
+          send({ type: 'subscribe', symbol });
+        }
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          console.error('[api] failed to load watchlist:', err);
+        }
+      })
+      .finally(() => clearTimeout(timeout));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally runs once on mount
 
   useEffect(() => {
     destroyedRef.current = false;
@@ -99,10 +129,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
 
       ws.onopen = () => {
         setConnection('connected');
-        // A new connection may be talking to a freshly restarted server whose
-        // mock fallback has no lastPrice state and will emit DEFAULT_SEED_PRICES.
-        // Stale baselines from the previous connection would produce nonsensical
-        // changePct values, so reset here and let the first tick re-anchor.
         sessionBaseline.current.clear();
         subscribeAll();
       };
@@ -123,9 +149,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
         if (msg.type === 'tick') {
           const { symbol, price, source } = msg;
 
-          // Record the first tick for this symbol as the session baseline.
-          // changePct is then always (currentPrice - sessionOpen) / sessionOpen,
-          // not a rolling accumulation from the mock seed price.
           const baseline = sessionBaseline.current;
           if (!baseline.has(symbol)) {
             baseline.set(symbol, price);
@@ -141,7 +164,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
             return next;
           });
 
-          // Merge tick into the last candle of the active chart.
           if (symbol === selectedRef.current) {
             setCandles((prev) => {
               const next = prev.map((c) => ({ ...c }));
@@ -156,7 +178,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       };
 
       ws.onerror = () => {
-        // 'error' always fires before 'close'; let onclose own the reconnect loop.
         setConnection('disconnected');
       };
 
@@ -179,10 +200,8 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
 
   const selectSymbol = useCallback((symbol: string) => {
     setSelected(symbol);
-    // Seed the chart with synthesised history at the current price.
     const w = watchlistRef.current.find((x) => x.symbol === symbol);
     if (w) setCandles(genCandles(w.price, w.changePct, timeframeRef.current));
-    // Tell the relay to start forwarding ticks for this symbol.
     send({ type: 'subscribe', symbol });
   }, [send]);
 
@@ -192,16 +211,34 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     if (w) setCandles(genCandles(w.price, w.changePct, tf));
   }, [selected]);
 
-  const addSymbol = useCallback((symbol: string) => {
-    setWatchlist((prev) => {
-      if (prev.some((w) => w.symbol === symbol)) return prev;
-      const u = UNIVERSE.find((x) => x.symbol === symbol);
-      if (!u) return prev;
-      // changePct will be set correctly on the first tick from the relay.
-      return [...prev, { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const }];
+  const addSymbol = useCallback(async (symbol: string) => {
+    if (watchlistRef.current.some((w) => w.symbol === symbol)) return;
+    const item = buildItem(symbol);
+    if (!item) return;
+
+    const res = await fetch(`${API_URL}/api/watchlist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-session-id': SESSION_ID },
+      body: JSON.stringify({ symbol }),
     });
+
+    if (res.status === 409) return; // already saved by another tab
+    if (!res.ok) { console.error('[api] failed to add symbol', symbol); return; }
+
+    setWatchlist((prev) => (prev.some((w) => w.symbol === symbol) ? prev : [...prev, item]));
     send({ type: 'subscribe', symbol });
   }, [send]);
 
-  return { watchlist, connection, selected, timeframe, candles, selectSymbol, setTimeframe, addSymbol };
+  const removeSymbol = useCallback(async (symbol: string) => {
+    setWatchlist((prev) => prev.filter((w) => w.symbol !== symbol));
+
+    await fetch(`${API_URL}/api/watchlist/${encodeURIComponent(symbol)}`, {
+      method: 'DELETE',
+      headers: { 'x-session-id': SESSION_ID },
+    }).catch((err) => console.error('[api] failed to remove symbol', symbol, err));
+
+    send({ type: 'unsubscribe', symbol });
+  }, [send]);
+
+  return { watchlist, connection, selected, timeframe, candles, selectSymbol, setTimeframe, addSymbol, removeSymbol };
 }
