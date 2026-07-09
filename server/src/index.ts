@@ -18,6 +18,10 @@ const ALLOWED_ORIGINS = new Set([
   ...(process.env.CLIENT_ORIGIN ? [process.env.CLIENT_ORIGIN] : []),
 ]);
 
+// Single source-of-truth for the HTTP CORS origin header.
+// In production CLIENT_ORIGIN is the Vercel URL; locally it falls back to *.
+const CORS_ORIGIN = process.env.CLIENT_ORIGIN ?? '*';
+
 if (!API_KEY) {
   console.error("[relay] FINNHUB_API_KEY is not set in server/.env — exiting");
   process.exit(1);
@@ -45,8 +49,24 @@ const finnhub = new FinnhubClient({
 // ── HTTP server (needed to inspect the Upgrade request for CORS) ─────────────
 
 const server = http.createServer(async (req, res) => {
+  // Set CORS headers on every HTTP response before any routing.
+  // res.setHeader values are merged into the final response; they are NOT
+  // overridden by later res.writeHead calls unless writeHead repeats the same key.
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-session-id');
+
   const method = req.method ?? 'GET';
   const url = new URL(req.url ?? '/', 'http://localhost');
+
+  // OPTIONS preflight — browsers send this before cross-origin POST/DELETE.
+  // Must respond 200 with the CORS headers (already set above) or the real
+  // request never fires.
+  if (method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
 
   // Health check
   if (url.pathname === '/health' && method === 'GET') {

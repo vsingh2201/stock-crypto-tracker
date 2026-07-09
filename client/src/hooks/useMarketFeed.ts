@@ -80,6 +80,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   // Load persisted watchlist from the REST API on mount.
   // Falls back to the seed data already in state if the request fails or times out.
   useEffect(() => {
+    console.log('[api] REST base URL:', API_URL);
     const controller = new AbortController();
     const timeout = setTimeout(() => {
       controller.abort();

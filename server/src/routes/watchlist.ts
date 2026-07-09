@@ -4,15 +4,11 @@ import type { FinnhubClient } from '../finnhubClient';
 
 const SEED_SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'NVDA', 'AAPL', 'TSLA', 'SPY'];
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'x-session-id, content-type',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-};
-
+// CORS headers are set upstream in index.ts via res.setHeader() before this
+// handler is called, so we only need Content-Type here.
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json', ...CORS_HEADERS });
+  res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(payload);
 }
 
@@ -43,13 +39,6 @@ export async function handleWatchlist(
   const url = new URL(req.url ?? '/', 'http://localhost');
   const { pathname } = url;
   const method = req.method ?? 'GET';
-
-  // CORS preflight
-  if (method === 'OPTIONS' && pathname.startsWith('/api/watchlist')) {
-    res.writeHead(204, CORS_HEADERS);
-    res.end();
-    return true;
-  }
 
   if (!pathname.startsWith('/api/watchlist')) return false;
 
