@@ -130,6 +130,8 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
 
       ws.onopen = () => {
         setConnection('connected');
+        // Clear before subscribeAll so stale baselines from the previous
+        // connection never mix with prices emitted by a freshly restarted server.
         sessionBaseline.current.clear();
         subscribeAll();
       };
@@ -150,12 +152,19 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
         if (msg.type === 'tick') {
           const { symbol, price, source } = msg;
 
+          // Baseline is only ever anchored from a live Finnhub tick, never from
+          // mock data. Mock seed prices (e.g. $100 fallback for AMD) can be orders
+          // of magnitude away from the real market price ($500+), which would
+          // produce wildly wrong changePct values the moment real ticks arrive.
+          // Until the first live tick anchors the baseline, changePct stays 0.
           const baseline = sessionBaseline.current;
-          if (!baseline.has(symbol)) {
+          if (source === 'live' && !baseline.has(symbol)) {
             baseline.set(symbol, price);
           }
-          const sessionOpen = baseline.get(symbol)!;
-          const changePct = ((price - sessionOpen) / sessionOpen) * 100;
+          const sessionOpen = baseline.get(symbol);
+          const changePct = sessionOpen !== undefined
+            ? ((price - sessionOpen) / sessionOpen) * 100
+            : 0;
 
           setWatchlist((prev) => {
             const idx = prev.findIndex((w) => w.symbol === symbol);

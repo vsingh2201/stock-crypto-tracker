@@ -176,41 +176,106 @@ change identity every render, breaking memoization downstream).
 
 ## WebSocket Hook
 
-Despite the name, there's no `WebSocket` object anywhere yet —
-`useMarketFeed` in `src/hooks/useMarketFeed.ts` is the seam where one will
-go. Today it:
+`useMarketFeed` in `src/hooks/useMarketFeed.ts` owns the live data pipeline.
+It opens a `WebSocket` to the Node relay server (configured via
+`VITE_WS_URL`), manages reconnection with a 3-second delay, and translates
+raw relay messages into the React state that `Dashboard` and its children
+consume.
 
-- Seeds `watchlist` and `candles` from the static mock data on mount.
-- Runs a `setInterval` every 1300ms that:
-  - has a 3.5% chance to flip `connection` to `'reconnecting'` and snap back
-    next tick,
-  - randomly walks the last candle's close/high/low,
-  - randomly walks every watchlist item's price within a type-dependent
-    drift band (crypto drifts more than stocks),
-  - syncs the selected symbol's displayed price to match the candle close so
-    the header and the chart never disagree.
-- Exposes the same shape a real feed would:
-  `{ watchlist, connection, selected, timeframe, candles, selectSymbol, setTimeframe, addSymbol }`.
+### Connection lifecycle
 
-### What changes when the real backend connects
+```
+mount → connect() → ws.onopen → subscribeAll()
+                 ↘ ws.onerror → ws.onclose → setTimeout(connect, 3000) → …
+```
 
-The `setInterval` body gets replaced by a `ws.onmessage` handler that parses
-whatever the relay server forwards from Finnhub (trade prints, or aggregated
-bars) and applies the *same* state-shape updates (`setWatchlist`,
-`setCandles`). `connection` becomes driven by the socket's
-`onopen`/`onclose`/`onerror` instead of `Math.random()`. Crucially, because
-the hook's **return shape doesn't change**, none of `Dashboard`, `Chart`, or
-`Watchlist` need to be touched — that's the entire point of isolating this
-behavior behind a hook.
+`connection` state (`'connected' | 'reconnecting' | 'disconnected'`) is
+driven by the socket's `onopen`/`onerror`/`onclose` events and also by
+`status` frames the relay server sends (e.g. when its own Finnhub upstream
+reconnects).
+
+### Session baseline — what it is and the live-only invariant
+
+`sessionBaseline` is a `Map<string, number>` stored in a `useRef`. It records
+the **first live price** ever seen for each symbol during the current browser
+session and is used to compute `changePct`:
+
+```
+changePct = (currentPrice − sessionOpen) / sessionOpen × 100
+```
+
+**Invariant: the baseline is only ever set from a `source === 'live'` tick,
+never from mock data.**
+
+The relay server's mock fallback kicks in when Finnhub goes quiet for 30 s
+(after-hours, weekends, market closed). Mock ticks use a server-side
+random-walk starting from hard-coded seed prices that can differ wildly from
+the real market price — for example AMD's mock seed is $158 while the real
+price might be $512. If a mock tick anchored the baseline, the moment real
+ticks arrived the percentage would show +224%, corrupting the display for the
+rest of the session.
+
+The rule in code is:
+
+```ts
+if (source === 'live' && !baseline.has(symbol)) {
+  baseline.set(symbol, price);   // anchor only on first live tick
+}
+const sessionOpen = baseline.get(symbol);
+const changePct = sessionOpen !== undefined
+  ? ((price - sessionOpen) / sessionOpen) * 100
+  : 0;   // no live tick yet — show 0.00% rather than a wrong value
+```
+
+Mock ticks still update the displayed `price` (so the sparkline keeps
+moving), but `changePct` stays `0` until the first live tick arrives for that
+symbol.
+
+### Baseline reset on reconnect
+
+In `ws.onopen`, `sessionBaseline.current.clear()` fires **before**
+`subscribeAll()`. This is load-bearing: if the server restarted while the
+browser was disconnected, it will have reset its mock price state to the
+hard-coded seed defaults. Keeping a stale baseline from the previous
+connection would produce wrong percentages on the next live tick. The clear
+ensures the first live tick after any reconnect re-anchors from a clean
+slate.
+
+### Tick → state update path
+
+Each `tick` message from the relay drives two independent state updates:
+
+1. **`setWatchlist`** — finds the matching symbol by index (O(n) but n ≤ ~20)
+   and produces a new array with the updated `price`, `changePct`, and
+   `source` for that row. Other rows are reference-equal to the previous
+   render, so React bails out of their subtrees.
+
+2. **`setCandles`** (only when `symbol === selectedRef.current`) — mutates a
+   copy of the last candle's `close`/`high`/`low` in place, leaving earlier
+   candles untouched. This is why the chart shows live movement only for the
+   currently selected symbol — subscribing to all symbols would produce
+   redundant renders with no visible benefit.
+
+### Return shape
+
+```ts
+{ watchlist, connection, selected, timeframe, candles,
+  selectSymbol, setTimeframe, addSymbol, removeSymbol }
+```
+
+`Dashboard` is the only caller. Keeping the return shape stable means none of
+`Chart`, `Watchlist`, or `Search` needed to change when the real WebSocket
+replaced the old mock `setInterval`.
 
 ### Interviewer angle
 
 *"How would you handle backpressure if Finnhub sends ticks faster than React
 can re-render?"* — Batch incoming messages in a ref/buffer and flush them on
 a `requestAnimationFrame` or fixed interval rather than calling `setState`
-per message. This is actually exactly what the current mock already does
-(batches per-interval rather than per-event), so it's a closer model of the
-real constraint than it might first appear.
+per message. The relay server already coalesces Finnhub's raw trade stream
+(which can be dozens of prints/second for a single ticker) before forwarding,
+so in practice the client sees at most one tick per symbol per websocket
+frame, but the batching pattern would be the right fix if that changed.
 
 ## TypeScript Types
 
