@@ -160,7 +160,17 @@ export function Dashboard() {
               }}
             />
           </div>
-          <Watchlist items={feed.watchlist} selected={feed.selected} gainColor={GAIN} lossColor={LOSS} onSelect={feed.selectSymbol} />
+          <Watchlist
+            items={feed.watchlist}
+            selected={feed.selected}
+            gainColor={GAIN}
+            lossColor={LOSS}
+            onSelect={feed.selectSymbol}
+            onRemove={(symbol) => {
+              feed.removeSymbol(symbol);
+              showToast(`${symbol} removed from watchlist`);
+            }}
+          />
         </div>
       </div>
 

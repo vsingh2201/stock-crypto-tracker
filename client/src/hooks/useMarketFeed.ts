@@ -240,7 +240,23 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   }, [send]);
 
   const removeSymbol = useCallback(async (symbol: string) => {
-    setWatchlist((prev) => prev.filter((w) => w.symbol !== symbol));
+    const remaining = watchlistRef.current.filter((w) => w.symbol !== symbol);
+
+    if (remaining.length === 0) {
+      // Never leave the dashboard empty — restore the first seed symbol locally.
+      // (We don't re-persist it to the DB; the user intentionally cleared their list.)
+      const fallback = buildItem(SEED_WATCHLIST[0].symbol)!;
+      setWatchlist([fallback]);
+      setSelected(fallback.symbol);
+      setCandles(genCandles(fallback.price, 0, timeframeRef.current));
+    } else {
+      setWatchlist(remaining);
+      if (selectedRef.current === symbol) {
+        const next = remaining[0];
+        setSelected(next.symbol);
+        setCandles(genCandles(next.price, next.changePct, timeframeRef.current));
+      }
+    }
 
     await fetch(`${API_URL}/api/watchlist/${encodeURIComponent(symbol)}`, {
       method: 'DELETE',

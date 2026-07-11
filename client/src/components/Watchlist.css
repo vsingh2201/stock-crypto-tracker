@@ -7,13 +7,27 @@
 .watchlist__row {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  /* 4th column (22px) always reserves space for the remove button so
+     nothing shifts on hover — the button is just invisible until then. */
+  grid-template-columns: 1fr auto auto 22px;
   align-items: center;
   gap: 12px;
-  padding: 11px 12px 11px 14px;
+  padding: 11px 8px 11px 14px;
   border-radius: 10px;
   cursor: pointer;
   margin-bottom: 2px;
+}
+
+@keyframes watchlistRowFadeOut {
+  to {
+    opacity: 0;
+    transform: translateX(6px);
+  }
+}
+
+.watchlist__row--removing {
+  animation: watchlistRowFadeOut 0.22s ease-out forwards;
+  pointer-events: none;
 }
 
 .watchlist__bar {
@@ -73,4 +87,39 @@
   margin-left: 5px;
   vertical-align: middle;
   opacity: 0.85;
+}
+
+/* ── Remove button ─────────────────────────────────────────────────────────── */
+
+.watchlist__remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: none;
+  background: transparent;
+  color: #555e72;
+  cursor: pointer;
+  padding: 0;
+  /* Hidden by default — visible only when the row is hovered.
+     pointer-events: none prevents accidental clicks when not visible. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+
+.watchlist__row:hover .watchlist__remove {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.watchlist__remove:hover {
+  background: rgba(246, 70, 93, 0.12);
+  color: #f6465d;
+}
+
+.watchlist__remove:active {
+  background: rgba(246, 70, 93, 0.2);
 }
