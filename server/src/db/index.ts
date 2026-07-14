@@ -6,12 +6,18 @@ export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+const MIGRATIONS = [
+  '001_create_watchlist.sql',
+  '002_create_alerts.sql',
+];
+
 export async function runMigrations(): Promise<void> {
   await pool.query('SELECT 1'); // verify connection
   console.log('[db] connected');
 
-  const migrationPath = path.join(__dirname, 'migrations', '001_create_watchlist.sql');
-  const sql = fs.readFileSync(migrationPath, 'utf-8');
-  await pool.query(sql);
-  console.log('[db] migration complete');
+  for (const filename of MIGRATIONS) {
+    const sql = fs.readFileSync(path.join(__dirname, 'migrations', filename), 'utf-8');
+    await pool.query(sql);
+  }
+  console.log('[db] migrations complete');
 }

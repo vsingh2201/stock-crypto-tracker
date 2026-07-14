@@ -2,22 +2,28 @@ import WebSocket from 'ws';
 import type { PriceTick } from './types';
 
 /**
- * Tracks all connected browser clients and their symbol subscriptions.
+ * Tracks all connected browser clients, their symbol subscriptions, and their
+ * session IDs.
  *
- * Two mirrored maps keep O(1) lookups in both directions:
- *   clientSymbols  client → symbols it wants
- *   symbolClients  symbol → clients that want it
- *
- * This lets the relay cheaply answer:
- *   "who should receive a tick for AAPL?"
- *   "what symbols can we unsubscribe from Finnhub when this client leaves?"
+ * Three mirrored maps provide O(1) lookups in every direction:
+ *   clientSymbols   ws → symbols it wants
+ *   symbolClients   symbol → ws set that wants it
+ *   sessionClients  session_id → ws set for that session (for alert routing)
  */
 export class ClientManager {
   private clientSymbols = new Map<WebSocket, Set<string>>();
   private symbolClients = new Map<string, Set<WebSocket>>();
+  // One session can have multiple WebSocket connections (multiple tabs).
+  private sessionClients = new Map<string, Set<WebSocket>>();
+  private clientSession = new Map<WebSocket, string>();
 
-  addClient(ws: WebSocket): void {
+  addClient(ws: WebSocket, sessionId: string): void {
     this.clientSymbols.set(ws, new Set());
+    this.clientSession.set(ws, sessionId);
+    if (!this.sessionClients.has(sessionId)) {
+      this.sessionClients.set(sessionId, new Set());
+    }
+    this.sessionClients.get(sessionId)!.add(ws);
   }
 
   /**
@@ -25,9 +31,19 @@ export class ClientManager {
    * The caller uses this list to send Finnhub unsubscribe frames.
    */
   removeClient(ws: WebSocket): string[] {
+    // Clean up session mapping.
+    const sessionId = this.clientSession.get(ws);
+    if (sessionId) {
+      const sessionWs = this.sessionClients.get(sessionId);
+      if (sessionWs) {
+        sessionWs.delete(ws);
+        if (sessionWs.size === 0) this.sessionClients.delete(sessionId);
+      }
+      this.clientSession.delete(ws);
+    }
+
     const symbols = this.clientSymbols.get(ws);
     if (!symbols) return [];
-
     this.clientSymbols.delete(ws);
 
     const nowEmpty: string[] = [];
@@ -105,6 +121,17 @@ export class ClientManager {
   /** Send a raw JSON string to every connected client (e.g. status changes). */
   broadcastAll(payload: string): void {
     for (const ws of this.clientSymbols.keys()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+    }
+  }
+
+  /** Send a raw JSON string to all WebSocket connections owned by a session. */
+  sendToSession(sessionId: string, payload: string): void {
+    const clients = this.sessionClients.get(sessionId);
+    if (!clients) return;
+    for (const ws of clients) {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(payload);
       }

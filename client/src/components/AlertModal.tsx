@@ -7,12 +7,18 @@ import './AlertModal.css';
 interface AlertModalProps {
   quote: Quote;
   onClose: () => void;
-  onCreate: (direction: 'above' | 'below', target: number) => void;
+  onCreate: (direction: 'above' | 'below', target: number) => void | Promise<void>;
 }
 
 export function AlertModal({ quote, onClose, onCreate }: AlertModalProps) {
   const [direction, setDirection] = useState<'above' | 'below'>('above');
-  const [target, setTarget] = useState(() => formatPrice(quote.price * 1.03).replace(/,/g, ''));
+  const [target, setTarget] = useState(() => formatPrice(quote.price * 1.05).replace(/,/g, ''));
+
+  useEffect(() => {
+    setTarget(formatPrice(quote.price * (direction === 'above' ? 1.05 : 0.95)).replace(/,/g, ''));
+  // Reset default target whenever direction or quote changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [direction, quote.price]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -5,6 +5,7 @@ import type { Timeframe } from '../types';
 import { TopBar } from './TopBar';
 import { Chart } from './Chart';
 import { Watchlist } from './Watchlist';
+import { AlertList } from './AlertList';
 import { Search } from './Search';
 import { AlertModal } from './AlertModal';
 import { Toast } from './Toast';
@@ -45,11 +46,23 @@ export function Dashboard() {
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
-  const showToast = (msg: string) => {
+  const showToast = (msg: string, durationMs = 2400) => {
     clearTimeout(toastTimer.current);
     setToast(msg);
-    toastTimer.current = setTimeout(() => setToast(null), 2400);
+    toastTimer.current = setTimeout(() => setToast(null), durationMs);
   };
+
+  // Show 8-second in-app toast whenever an alert triggers.
+  useEffect(() => {
+    if (!feed.lastTriggered) return;
+    const { symbol, condition, targetPrice, triggeredPrice } = feed.lastTriggered;
+    const dir = condition === 'above' ? 'above' : 'below';
+    showToast(
+      `${symbol} ${dir} $${targetPrice.toLocaleString()} — now $${triggeredPrice.toLocaleString()}`,
+      8_000,
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feed.lastTriggered]);
 
   // Fall back to the first item if the selected symbol isn't in the watchlist yet
   // (e.g. during the brief window between the API response updating the watchlist
@@ -171,6 +184,10 @@ export function Dashboard() {
               showToast(`${symbol} removed from watchlist`);
             }}
           />
+          <AlertList
+            alerts={feed.alerts}
+            onDelete={feed.deleteAlert}
+          />
         </div>
       </div>
 
@@ -178,9 +195,12 @@ export function Dashboard() {
         <AlertModal
           quote={selectedQuote}
           onClose={() => setAlertOpen(false)}
-          onCreate={(direction, target) => {
-            setAlertOpen(false);
-            showToast(`Alert set · ${selectedQuote.symbol} crosses ${direction} $${target}`);
+          onCreate={async (direction, target) => {
+            const ok = await feed.createAlert(selectedQuote.symbol, direction, target);
+            if (ok) {
+              setAlertOpen(false);
+              showToast(`Alert set · ${selectedQuote.symbol} ${direction} $${target.toLocaleString()}`);
+            }
           }}
         />
       )}

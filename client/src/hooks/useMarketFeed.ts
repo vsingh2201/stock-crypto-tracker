@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SEED_WATCHLIST, UNIVERSE } from '../data/universe';
 import { genCandles, genSpark } from '../lib/marketMath';
-import type { Candle, ConnectionStatus, Timeframe, WatchlistItem } from '../types';
+import type { AlertItem, AlertTriggeredMsg, Candle, ConnectionStatus, Timeframe, WatchlistItem } from '../types';
 
 const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined) ?? 'ws://localhost:8080';
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:8080';
@@ -17,6 +17,37 @@ const SESSION_ID: string = (() => {
   return id;
 })();
 
+// ── Notification helpers ──────────────────────────────────────────────────────
+
+function playAlertBeep(): void {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.value = 880; // A5
+    gain.gain.setValueAtTime(0.25, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.6);
+  } catch {
+    // AudioContext not available (SSR, restricted context, etc.)
+  }
+}
+
+function showBrowserNotification(msg: AlertTriggeredMsg): void {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const dir = msg.condition === 'above' ? 'above' : 'below';
+  new Notification(`${msg.symbol} alert triggered`, {
+    body: `${msg.symbol} crossed ${dir} $${msg.targetPrice.toLocaleString()} — now $${msg.triggeredPrice.toLocaleString()}`,
+    icon: '/favicon.ico',
+  });
+}
+
+// ── Message types ─────────────────────────────────────────────────────────────
+
 interface TickMessage {
   type: 'tick';
   symbol: string;
@@ -31,13 +62,27 @@ interface StatusMessage {
   status: ConnectionStatus;
 }
 
-type RelayMessage = TickMessage | StatusMessage;
+type RelayMessage = TickMessage | StatusMessage | AlertTriggeredMsg;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildItem(symbol: string): WatchlistItem | null {
   const u = UNIVERSE.find((x) => x.symbol === symbol);
   if (!u) return null;
   return { symbol: u.symbol, name: u.name, exchange: u.exchange, type: u.type, price: u.seedPrice, changePct: 0, spark: genSpark(false), source: 'live' as const };
 }
+
+function rowToAlertItem(r: Record<string, unknown>): AlertItem {
+  return {
+    id: r.id as string,
+    symbol: r.symbol as string,
+    condition: r.condition as 'above' | 'below',
+    targetPrice: Number(r.target_price),
+    createdAt: r.created_at as string,
+  };
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe) {
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() =>
@@ -50,6 +95,8 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     const u = UNIVERSE.find((x) => x.symbol === initialSymbol)!;
     return genCandles(u.seedPrice, 0, initialTimeframe);
   });
+  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [lastTriggered, setLastTriggered] = useState<AlertTriggeredMsg | null>(null);
 
   const candlesRef = useRef(candles);
   candlesRef.current = candles;
@@ -78,7 +125,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
   }, [send]);
 
   // Load persisted watchlist from the REST API on mount.
-  // Falls back to the seed data already in state if the request fails or times out.
   useEffect(() => {
     console.log('[api] REST base URL:', API_URL);
     const controller = new AbortController();
@@ -94,38 +140,47 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       .then((r) => r.json())
       .then(({ symbols }: { symbols: string[] }) => {
         const items = symbols.map(buildItem).filter((x): x is WatchlistItem => x !== null);
-        if (items.length === 0) return; // nothing usable — keep seed data
+        if (items.length === 0) return;
 
         setWatchlist(items);
 
-        // If the currently selected symbol dropped out of the new watchlist,
-        // pivot to the first item so Dashboard never hits selectedQuote === undefined.
         if (!items.some((w) => w.symbol === selectedRef.current)) {
           const first = items[0];
           setSelected(first.symbol);
           setCandles(genCandles(first.price, first.changePct, timeframeRef.current));
         }
 
-        // Subscribe the loaded symbols if the WS is already open.
         for (const { symbol } of items) {
           send({ type: 'subscribe', symbol });
         }
       })
       .catch((err) => {
-        if (err.name !== 'AbortError') {
-          console.error('[api] failed to load watchlist:', err);
-        }
+        if (err.name !== 'AbortError') console.error('[api] failed to load watchlist:', err);
       })
       .finally(() => clearTimeout(timeout));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // intentionally runs once on mount
+  }, []);
 
+  // Load active alerts from the REST API on mount.
+  useEffect(() => {
+    fetch(`${API_URL}/api/alerts`, { headers: { 'x-session-id': SESSION_ID } })
+      .then((r) => r.json())
+      .then(({ alerts: rows }: { alerts: Record<string, unknown>[] }) => {
+        setAlerts(rows.map(rowToAlertItem));
+      })
+      .catch((err) => console.error('[api] failed to load alerts:', err));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // WebSocket connection + message handling.
   useEffect(() => {
     destroyedRef.current = false;
 
     function connect() {
       if (destroyedRef.current) return;
-      const ws = new WebSocket(WS_URL);
+      // Pass the session ID as a query param — browsers can't send custom
+      // headers during WebSocket upgrades.
+      const ws = new WebSocket(`${WS_URL}?sessionId=${SESSION_ID}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -149,14 +204,20 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
           return;
         }
 
+        if (msg.type === 'alert_triggered') {
+          setAlerts((prev) => prev.filter((a) => a.id !== msg.alertId));
+          setLastTriggered(msg);
+          playAlertBeep();
+          showBrowserNotification(msg);
+          return;
+        }
+
         if (msg.type === 'tick') {
           const { symbol, price, source } = msg;
 
           // Baseline is only ever anchored from a live Finnhub tick, never from
-          // mock data. Mock seed prices (e.g. $100 fallback for AMD) can be orders
-          // of magnitude away from the real market price ($500+), which would
-          // produce wildly wrong changePct values the moment real ticks arrive.
-          // Until the first live tick anchors the baseline, changePct stays 0.
+          // mock data. Mock seed prices can be far from market price, producing
+          // wildly wrong changePct values the moment real ticks arrive.
           const baseline = sessionBaseline.current;
           if (source === 'live' && !baseline.has(symbol)) {
             baseline.set(symbol, price);
@@ -232,7 +293,7 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
       body: JSON.stringify({ symbol }),
     });
 
-    if (res.status === 409) return; // already saved by another tab
+    if (res.status === 409) return;
     if (!res.ok) { console.error('[api] failed to add symbol', symbol); return; }
 
     setWatchlist((prev) => (prev.some((w) => w.symbol === symbol) ? prev : [...prev, item]));
@@ -243,8 +304,6 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     const remaining = watchlistRef.current.filter((w) => w.symbol !== symbol);
 
     if (remaining.length === 0) {
-      // Never leave the dashboard empty — restore the first seed symbol locally.
-      // (We don't re-persist it to the DB; the user intentionally cleared their list.)
       const fallback = buildItem(SEED_WATCHLIST[0].symbol)!;
       setWatchlist([fallback]);
       setSelected(fallback.symbol);
@@ -266,5 +325,39 @@ export function useMarketFeed(initialSymbol: string, initialTimeframe: Timeframe
     send({ type: 'unsubscribe', symbol });
   }, [send]);
 
-  return { watchlist, connection, selected, timeframe, candles, selectSymbol, setTimeframe, addSymbol, removeSymbol };
+  const createAlert = useCallback(async (
+    symbol: string,
+    condition: 'above' | 'below',
+    targetPrice: number,
+  ): Promise<boolean> => {
+    // Request notification permission the first time an alert is created.
+    if ('Notification' in window && Notification.permission === 'default') {
+      await Notification.requestPermission();
+    }
+
+    const res = await fetch(`${API_URL}/api/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-session-id': SESSION_ID },
+      body: JSON.stringify({ symbol, condition, target_price: targetPrice }),
+    });
+    if (!res.ok) { console.error('[api] failed to create alert'); return false; }
+
+    const row: Record<string, unknown> = await res.json();
+    setAlerts((prev) => [rowToAlertItem(row), ...prev]);
+    return true;
+  }, []);
+
+  const deleteAlert = useCallback(async (id: string) => {
+    setAlerts((prev) => prev.filter((a) => a.id !== id));
+    await fetch(`${API_URL}/api/alerts/${id}`, {
+      method: 'DELETE',
+      headers: { 'x-session-id': SESSION_ID },
+    }).catch((err) => console.error('[api] failed to delete alert', id, err));
+  }, []);
+
+  return {
+    watchlist, connection, selected, timeframe, candles,
+    alerts, lastTriggered,
+    selectSymbol, setTimeframe, addSymbol, removeSymbol, createAlert, deleteAlert,
+  };
 }

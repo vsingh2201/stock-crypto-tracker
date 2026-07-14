@@ -3,9 +3,11 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { FinnhubClient } from "./finnhubClient";
 import { ClientManager } from "./clientManager";
+import { AlertEngine } from "./alertEngine";
 import { runMigrations } from "./db";
 import { handleWatchlist } from "./routes/watchlist";
-import type { ClientMessage, StatusMessage } from "./types";
+import { handleAlerts } from "./routes/alerts";
+import type { AlertTriggeredMessage, ClientMessage, StatusMessage } from "./types";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -13,7 +15,9 @@ const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const API_KEY = process.env.FINNHUB_API_KEY;
 
 const ALLOWED_ORIGINS = new Set([
+  "http://localhost:5173",
   "http://localhost:5174",
+  "http://127.0.0.1:5173",
   "http://127.0.0.1:5174",
   ...(process.env.CLIENT_ORIGIN ? [process.env.CLIENT_ORIGIN] : []),
 ]);
@@ -31,14 +35,30 @@ if (!API_KEY) {
 
 const clientManager = new ClientManager();
 
+const alertEngine = new AlertEngine((alert, triggeredPrice) => {
+  const msg: AlertTriggeredMessage = {
+    type: 'alert_triggered',
+    alertId: alert.id,
+    symbol: alert.symbol,
+    condition: alert.condition,
+    targetPrice: alert.target_price,
+    triggeredPrice,
+    triggeredAt: new Date().toISOString(),
+  };
+  clientManager.sendToSession(alert.session_id, JSON.stringify(msg));
+  console.log(
+    `[alerts] triggered: ${alert.symbol} ${alert.condition} ${alert.target_price} → ${triggeredPrice} (session ${alert.session_id})`,
+  );
+});
+
 const finnhub = new FinnhubClient({
   apiKey: API_KEY,
 
-  // Every Finnhub trade tick → broadcast to the clients watching that symbol.
-  onTick: (tick) => clientManager.broadcast(tick),
+  onTick: (tick) => {
+    clientManager.broadcast(tick);
+    alertEngine.checkTick(tick.symbol, tick.price, tick.source);
+  },
 
-  // Finnhub connection state → notify all browser clients so they can show
-  // the live/reconnecting/disconnected pill in the UI.
   onStatusChange: (status) => {
     console.log(`[relay] finnhub → ${status}`);
     const msg: StatusMessage = { type: "status", status };
@@ -46,12 +66,10 @@ const finnhub = new FinnhubClient({
   },
 });
 
-// ── HTTP server (needed to inspect the Upgrade request for CORS) ─────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   // Set CORS headers on every HTTP response before any routing.
-  // res.setHeader values are merged into the final response; they are NOT
-  // overridden by later res.writeHead calls unless writeHead repeats the same key.
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-session-id');
@@ -60,8 +78,6 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
 
   // OPTIONS preflight — browsers send this before cross-origin POST/DELETE.
-  // Must respond 200 with the CORS headers (already set above) or the real
-  // request never fires.
   if (method === 'OPTIONS') {
     res.writeHead(200);
     res.end();
@@ -75,9 +91,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Watchlist REST API
-  const handled = await handleWatchlist(req, res, finnhub);
-  if (handled) return;
+  if (await handleWatchlist(req, res, finnhub)) return;
+  if (await handleAlerts(req, res, alertEngine)) return;
 
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Pulse relay — WebSocket endpoint");
@@ -92,8 +107,6 @@ const wss = new WebSocketServer({
     req: http.IncomingMessage;
     secure: boolean;
   }) => {
-    // Browser WebSocket connections include an Origin header. Allow the React
-    // dev server and also connections with no origin (curl / test clients).
     const origin = info.origin;
     return !origin || ALLOWED_ORIGINS.has(origin);
   },
@@ -101,9 +114,15 @@ const wss = new WebSocketServer({
 
 wss.on("connection", (ws: WebSocket, req) => {
   const ip = req.socket.remoteAddress ?? "unknown";
-  clientManager.addClient(ws);
+
+  // The browser WebSocket API cannot send custom headers during an upgrade,
+  // so the session ID is passed as a query parameter on the WS URL.
+  const reqUrl = new URL(req.url ?? '/', 'http://localhost');
+  const sessionId = reqUrl.searchParams.get('sessionId') ?? '';
+
+  clientManager.addClient(ws, sessionId);
   console.log(
-    `[relay] client connected from ${ip} (total: ${clientManager.clientCount})`,
+    `[relay] client connected from ${ip} session=${sessionId || '(none)'} (total: ${clientManager.clientCount})`,
   );
 
   ws.on("message", (raw) => {
@@ -111,7 +130,7 @@ wss.on("connection", (ws: WebSocket, req) => {
     try {
       msg = JSON.parse(raw.toString()) as ClientMessage;
     } catch {
-      return; // ignore malformed frames
+      return;
     }
 
     const { type, symbol } = msg;
@@ -119,19 +138,16 @@ wss.on("connection", (ws: WebSocket, req) => {
 
     if (type === "subscribe") {
       const isFirst = clientManager.subscribe(ws, symbol);
-      // Only subscribe upstream when this is the first client wanting this symbol.
       if (isFirst) finnhub.subscribe(symbol);
       console.log(`[relay] subscribe   ${symbol}  isFirst=${isFirst}`);
     } else if (type === "unsubscribe") {
       const isEmpty = clientManager.unsubscribe(ws, symbol);
-      // Only unsubscribe upstream when no clients are watching this symbol any more.
       if (isEmpty) finnhub.unsubscribe(symbol);
       console.log(`[relay] unsubscribe ${symbol}  isEmpty=${isEmpty}`);
     }
   });
 
   ws.on("close", () => {
-    // removeClient returns every symbol that now has zero watchers.
     const freed = clientManager.removeClient(ws);
     for (const sym of freed) {
       finnhub.unsubscribe(sym);
@@ -150,6 +166,7 @@ wss.on("connection", (ws: WebSocket, req) => {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 runMigrations()
+  .then(() => alertEngine.load())
   .then(() => {
     server.listen(PORT, () => {
       console.log(`[relay] listening on ws://localhost:${PORT}`);
@@ -157,7 +174,7 @@ runMigrations()
     });
   })
   .catch((err) => {
-    console.error('[db] failed to connect or migrate:', err);
+    console.error('[db] startup failed:', err);
     process.exit(1);
   });
 

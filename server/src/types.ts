@@ -28,7 +28,17 @@ export interface StatusMessage {
   status: 'connected' | 'reconnecting' | 'disconnected';
 }
 
-export type ServerMessage = TickMessage | StatusMessage;
+export interface AlertTriggeredMessage {
+  type: 'alert_triggered';
+  alertId: string;
+  symbol: string;
+  condition: 'above' | 'below';
+  targetPrice: number;
+  triggeredPrice: number;
+  triggeredAt: string;
+}
+
+export type ServerMessage = TickMessage | StatusMessage | AlertTriggeredMessage;
 
 // ── Finnhub wire format (upstream) ──────────────────────────────────────────
 
@@ -49,6 +59,18 @@ export interface FinnhubPingMsg {
 }
 
 export type FinnhubMessage = FinnhubTradeMsg | FinnhubPingMsg;
+
+// ── DB entities ─────────────────────────────────────────────────────────────
+
+export interface Alert {
+  id: string;
+  session_id: string;
+  symbol: string;
+  condition: 'above' | 'below';
+  target_price: number; // pg DECIMAL returns as number after CAST(…AS float8)
+  triggered_at: string | null;
+  created_at: string;
+}
 
 // ── Internal ────────────────────────────────────────────────────────────────
 

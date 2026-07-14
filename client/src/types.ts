@@ -34,3 +34,21 @@ export interface AlertCondition {
   direction: 'above' | 'below';
   target: number;
 }
+
+export interface AlertItem {
+  id: string;
+  symbol: string;
+  condition: 'above' | 'below';
+  targetPrice: number;
+  createdAt: string;
+}
+
+export interface AlertTriggeredMsg {
+  type: 'alert_triggered';
+  alertId: string;
+  symbol: string;
+  condition: 'above' | 'below';
+  targetPrice: number;
+  triggeredPrice: number;
+  triggeredAt: string;
+}

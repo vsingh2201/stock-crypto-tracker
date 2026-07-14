@@ -1014,3 +1014,122 @@ mock mode?** Without the immediate call, clients would wait up to 2 seconds
 after the mode transition before seeing any movement. Emitting right away means
 the UI responds at the exact moment the threshold is crossed, not 2 seconds
 later.
+
+---
+
+## 10. Price Alerts & AlertEngine
+
+### Overview
+
+The price-alert system lets a browser session set a threshold on any symbol
+(e.g. "notify me when BTC-USD crosses above $70,000"). When a live price tick
+hits the threshold, the server pushes an `alert_triggered` WebSocket message
+directly to the session that owns the alert, marks the alert triggered in the
+database, and removes it from the in-memory engine so it fires at most once.
+
+### Data model
+
+```sql
+CREATE TABLE alerts (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id     VARCHAR(64) NOT NULL,
+  symbol         VARCHAR(20) NOT NULL,
+  condition      VARCHAR(10) NOT NULL CHECK (condition IN ('above', 'below')),
+  target_price   DECIMAL(18, 8) NOT NULL,
+  triggered_at   TIMESTAMPTZ DEFAULT NULL,
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+`triggered_at IS NULL` is the live/fired discriminator — all hot-path queries
+filter on it so triggered alerts are never re-checked.
+
+### In-memory Map pattern (`alertEngine.ts`)
+
+```
+AlertEngine
+  bySymbol: Map<symbol, Alert[]>   ← O(1) lookup per tick
+  byId:     Map<id, Alert>         ← O(1) remove by ID
+```
+
+On startup `alertEngine.load()` reads every untriggered alert from the DB into
+both maps. After that the DB is never queried on the hot path — only written to
+when an alert fires (`UPDATE alerts SET triggered_at = NOW()`).
+
+The two maps are kept in sync by `index()` (insert) and `remove()` (delete).
+`remove()` is called both when an alert triggers and when a client DELETEs it
+via the REST API.
+
+### Alert checking on tick (`checkTick`)
+
+```typescript
+checkTick(symbol: string, price: number, source: 'live' | 'mock'): void {
+  if (source !== 'live') return;          // never trigger from mock ticks
+  const alerts = this.bySymbol.get(symbol);
+  for (const alert of [...alerts]) {
+    const hit = (alert.condition === 'above' && price >= alert.target_price)
+             || (alert.condition === 'below' && price <= alert.target_price);
+    if (hit) { this.remove(alert.id); ... this.onAlert(alert, price); }
+  }
+}
+```
+
+The `[...alerts]` spread is intentional — `remove()` mutates the array stored
+in `bySymbol`, so iterating over the original snapshot avoids a mid-loop
+mutation.
+
+### Session routing
+
+Alerts are delivered only to the session that created them. This works through
+two maps in `ClientManager`:
+
+```
+sessionClients: Map<session_id, Set<WebSocket>>
+clientSession:  Map<WebSocket, session_id>
+```
+
+When a WebSocket connects, its `?sessionId=` query param is recorded in both
+maps. `sendToSession(sessionId, payload)` iterates the Set and delivers to
+every open tab that shares the session.
+
+Because the browser WebSocket API cannot send custom HTTP headers during an
+upgrade request, the session ID is passed as a URL query parameter
+(`?sessionId=...`) and extracted on the server via
+`new URL(req.url, 'http://localhost').searchParams.get('sessionId')`.
+
+### REST API (`routes/alerts.ts`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET    | `/api/alerts` | Return all untriggered alerts for the session |
+| POST   | `/api/alerts` | Create a new alert, add to engine, return the row |
+| DELETE | `/api/alerts/:id` | Delete alert (session-scoped), remove from engine |
+
+All responses use `CAST(target_price AS float8)` to avoid the node-postgres
+behaviour where `DECIMAL` columns are returned as strings.
+
+### Key invariants
+
+- **Mock ticks never trigger alerts.** `checkTick` returns immediately when
+  `source !== 'live'`. This mirrors the sessionBaseline invariant in the client.
+- **Each alert fires at most once.** `remove()` is called before `onAlert()`,
+  so even if two ticks race, the second finds an empty slot.
+- **DB write is fire-and-forget.** The `UPDATE triggered_at` query is
+  `.catch()`-logged but not awaited — the in-memory engine is the source of
+  truth. A server restart re-reads from the DB, which still shows
+  `triggered_at IS NULL` only for unfired alerts.
+
+### FAQ
+
+**Why not query the DB on every tick?** The tick rate can be hundreds per
+second across dozens of symbols. A DB query per tick would overwhelm the
+connection pool. The in-memory Map brings per-tick cost to O(1) and
+amortises the startup `SELECT` across the lifetime of the process.
+
+**What happens if the server restarts mid-session?** `alertEngine.load()`
+re-reads all untriggered alerts, so in-flight alerts survive a restart.
+The client re-connects via the existing WebSocket reconnect logic.
+
+**Why `byId` in addition to `bySymbol`?** `bySymbol` is the hot path (checked
+per tick); `byId` makes the REST DELETE O(1) without scanning every symbol's
+list. Both maps are updated together in `index()` and `remove()`.
